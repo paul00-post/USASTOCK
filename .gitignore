@@ -1,0 +1,66 @@
+# 환경 설정
+.env
+
+# 모델 파일
+models/saved/*.pt
+models/saved/*.pkl
+models/saved/*.json
+
+# 캐시 데이터 (용량 큰 바이너리, 전부 재수집 가능) — 2026-07-16 데이터 수집
+# 테스트 중 실제로 생성돼 누락이 확인된 경로 추가(price_cache_meta, SEC 필링
+# 원문 캐시는 종목당 최대 20MB대라 git에 절대 올리면 안 됨).
+data/price_cache/
+data/price_cache_meta/
+data/*_cache/
+data/*_raw_cache/
+data/minute_bars/
+data/index_constituents/
+data/vanguard_500_filings/
+data/sec_company_tickers.json
+data/sec_shares.json
+data/sp500_gics_sector.csv
+data/universe_name_unmatched.csv
+
+# 실운용 상태 파일
+portfolio_state.json
+watchlist_cache.json
+
+# 브로커 접근토큰 캐시 (민감 정보) — 모의/실전 분리 파일명 둘 다 제외
+data/*token_cache*.json
+
+# 백테스팅 결과 (재실행 가능)
+backtest/results/factor_dataset_*.parquet
+backtest/results/walk_forward_results.json
+backtest/results/wfv_checkpoint*.json
+backtest/results/trade_log.parquet
+reports/
+
+# 스냅샷 예외 (MetaML 학습 데이터 — 반드시 git에 포함)
+!backtest/results/weekly_snapshots/
+!backtest/results/weekly_snapshots/**
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 로그
+*.log
+logs/

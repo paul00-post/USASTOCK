@@ -25,12 +25,28 @@ SHARES_PATH = DATA_DIR / "sec_shares.json"
 
 
 def _latest_shares_outstanding(companyfacts: dict) -> int | None:
-    """dei:EntityCommonStockSharesOutstanding 중 가장 최근(filed 최댓값) 값."""
-    dei = companyfacts.get("facts", {}).get("dei", {})
-    facts = dei.get("EntityCommonStockSharesOutstanding", {}).get("units", {}).get("shares", [])
-    if not facts:
+    """
+    발행주식수 최근값(filed 최댓값). dei:EntityCommonStockSharesOutstanding을
+    우선 쓰고, 없으면 us-gaap:CommonStockSharesOutstanding(대차대조표 각주)
+    으로, 그마저 없으면 WeightedAverageNumberOfSharesOutstandingBasic(가중
+    평균치라 시점 스냅샷보다는 부정확하지만 없는 것보단 나음)으로 폴백한다.
+
+    (2026-07-16 확인 — dei 태그 하나만 봤을 때 DELL/GOOGL/DKS/CVNA/COIN 등
+    70개 종목이 발행주식수 없이 통째로 빠졌다. 이 회사들 상당수는 dei 태그
+    없이 us-gaap:CommonStockSharesOutstanding만 쓰고 있었음.)
+    """
+    facts = companyfacts.get("facts", {})
+    dei = facts.get("dei", {})
+    shares = dei.get("EntityCommonStockSharesOutstanding", {}).get("units", {}).get("shares", [])
+    if not shares:
+        gaap = facts.get("us-gaap", {})
+        shares = gaap.get("CommonStockSharesOutstanding", {}).get("units", {}).get("shares", [])
+    if not shares:
+        gaap = facts.get("us-gaap", {})
+        shares = gaap.get("WeightedAverageNumberOfSharesOutstandingBasic", {}).get("units", {}).get("shares", [])
+    if not shares:
         return None
-    latest = max(facts, key=lambda f: f.get("filed", ""))
+    latest = max(shares, key=lambda f: f.get("filed", ""))
     return int(latest["val"])
 
 

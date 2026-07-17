@@ -60,6 +60,7 @@ logger = get_logger(__name__)
 RESULTS_DIR = BACKTEST_DIR / "results"
 SAVED_DIR   = MODELS_DIR / "saved"
 ARCHIVE_DIR = MODELS_DIR / "archive"
+STREAM_CACHE_DIR = MODELS_DIR / "cache_c"
 
 
 def _get_device() -> str:
@@ -139,6 +140,129 @@ def collect_all_ohlcv(
                 logger.warning("Buy 비율 50%% 초과 — K(현재=1.0)를 1.2~1.5로 소폭 조정 검토")
 
     return X_cnn, y_cnn, X_lstm, y_lstm
+
+
+def collect_all_ohlcv_streaming(
+    tickers: list[str],
+    start_year: int,
+    end_year: int,
+    cache_dir: Path,
+    label_fn=None,
+) -> dict[str, "Path | int"]:
+    """
+    collect_all_ohlcv의 디스크 기반 버전 — 종목별 배열을 파이썬 리스트에 전부
+    쌓아뒀다가 한 번에 concatenate하지 않는다.
+
+    2026-07-17 실제 확인된 문제 두 가지:
+    ① 전 종목(1000+)×20년치를 window=100으로 쌓으면 LSTM 쪽만 20~30GB대로
+       불어나 RAM(16GB)을 초과해서 MemoryError로 죽음(원래 collect_all_ohlcv).
+    ② 종목별 임시 .npz를 먼저 다 쓰고 나중에 합치는 1차 버전은, 병합 시점에
+       "임시파일 전체 + 최종파일"이 동시에 디스크에 존재해 순간 필요 용량이
+       거의 2배(fold1 기준 40GB대 → 80GB대)까지 치솟아 디스크 여유공간(수십GB)도
+       넘겨 "No space left on device"로 죽음.
+
+    그래서 2-패스로 짠다 — 1차 패스는 종목별 라벨·시퀀스를 계산만 해서
+    "몇 개 샘플이 나오는지" 개수만 세고 버린다(디스크에 아무것도 안 씀).
+    그 총합으로 최종 크기의 memmap을 한 번만 할당한 뒤, 2차 패스에서 같은
+    계산을 다시 해서(가격 캐시는 로컬 parquet라 재계산 비용이 크지 않음)
+    이번엔 임시파일 없이 바로 그 memmap의 해당 위치에 적어 넣는다 — 디스크에
+    최종 파일 용량만큼만 잡힌다.
+
+    fold 재실행 시 이미 만들어진 최종 파일이 있으면 재사용(재수집 스킵).
+
+    Returns
+    -------
+    {"X_cnn": Path, "y_cnn": Path, "n_cnn": int,
+     "X_lstm": Path, "y_lstm": Path, "n_lstm": int}
+    """
+    if label_fn is None:
+        label_fn = generate_labels
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    out_paths = {
+        "X_cnn":  cache_dir / "X_cnn.npy",  "y_cnn":  cache_dir / "y_cnn.npy",
+        "X_lstm": cache_dir / "X_lstm.npy", "y_lstm": cache_dir / "y_lstm.npy",
+    }
+    if all(p.exists() for p in out_paths.values()):
+        n_cnn  = np.load(out_paths["y_cnn"],  mmap_mode="r").shape[0]
+        n_lstm = np.load(out_paths["y_lstm"], mmap_mode="r").shape[0]
+        logger.info("스트리밍 캐시 존재 — 수집 스킵 (%s)", cache_dir)
+        return {**out_paths, "n_cnn": n_cnn, "n_lstm": n_lstm}
+
+    start_str = f"{start_year}-01-01"
+    end_str   = f"{end_year}-12-31"
+
+    # 종목별 원본(가격·라벨·기술지표)은 펼치기 전이라 가벼워서(종목당 1MB 안팎)
+    # 전 종목(1000+)을 캐싱해도 1~2GB 수준 — 국내 프로젝트의 "메모리 사전 로드로
+    # 반복 I/O 제거" 원칙과 동일(build_factor_dataset._preload_all 참고). RAM이
+    # 부족해 죽었던 건 "윈도우로 펼친 뒤"의 대량 배열이지 원본이 아니므로, 원본은
+    # 캐싱하고 펼치기(make_sequences/make_lstm_sequences)만 패스마다 다시 한다
+    # — 가격 재조회·라벨 재계산·기술지표 재계산을 2번 하지 않는다(2026-07-17,
+    # 이 캐싱 없이 2-패스로 짰다가 종목당 계산을 통째로 두 번 하고 있었음을 확인).
+    ticker_cache: dict[str, tuple] = {}
+    for ticker in tqdm(tickers, desc="가격/라벨/기술지표 로드"):
+        df = load_price_cache(ticker)
+        if df is None or df.empty:
+            continue
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df[(df["Date"] >= start_str) & (df["Date"] <= end_str)].copy()
+        if len(df) < LSTM_WINDOW + 20:
+            continue
+        label_df = label_fn(df)
+        try:
+            tech_df = compute_technical_features(df)
+        except AssertionError as e:
+            logger.warning("%s 기술 지표 계산 실패: %s", ticker, e)
+            tech_df = None
+        ticker_cache[ticker] = (df, label_df, tech_df)
+
+    # ── 1차 패스: 샘플 개수만 집계(디스크 미사용, 캐시에서 펼치기만) ────────────
+    n_cnn_total = 0
+    n_lstm_total = 0
+    for df, label_df, tech_df in ticker_cache.values():
+        X_cnn, _ = make_sequences(df, label_df)
+        n_cnn_total += len(X_cnn)
+        if tech_df is not None:
+            X_lstm, _ = make_lstm_sequences(tech_df, label_df)
+            n_lstm_total += len(X_lstm)
+
+    X_cnn_mm  = np.lib.format.open_memmap(out_paths["X_cnn"],  mode="w+", dtype=np.float32, shape=(n_cnn_total, 5, CNN_WINDOW))
+    y_cnn_mm  = np.lib.format.open_memmap(out_paths["y_cnn"],  mode="w+", dtype=np.int64,   shape=(n_cnn_total,))
+    X_lstm_mm = np.lib.format.open_memmap(out_paths["X_lstm"], mode="w+", dtype=np.float32, shape=(n_lstm_total, LSTM_WINDOW, 17))
+    y_lstm_mm = np.lib.format.open_memmap(out_paths["y_lstm"], mode="w+", dtype=np.int64,   shape=(n_lstm_total,))
+
+    # ── 2차 패스: 캐시에서 다시 펼쳐서 memmap에 바로 기록 ───────────────────────
+    cnn_offset = 0
+    lstm_offset = 0
+    for ticker, (df, label_df, tech_df) in tqdm(ticker_cache.items(), desc="OHLCV 수집(디스크 직기록)"):
+        X_cnn, y_cnn = make_sequences(df, label_df)
+        if len(X_cnn) > 0:
+            n = len(X_cnn)
+            X_cnn_mm[cnn_offset:cnn_offset + n] = X_cnn
+            y_cnn_mm[cnn_offset:cnn_offset + n] = y_cnn
+            cnn_offset += n
+
+        if tech_df is not None:
+            X_lstm, y_lstm = make_lstm_sequences(tech_df, label_df)
+            if len(X_lstm) > 0:
+                n = len(X_lstm)
+                X_lstm_mm[lstm_offset:lstm_offset + n] = X_lstm
+                y_lstm_mm[lstm_offset:lstm_offset + n] = y_lstm
+                lstm_offset += n
+
+    X_cnn_mm.flush(); y_cnn_mm.flush(); X_lstm_mm.flush(); y_lstm_mm.flush()
+    del X_cnn_mm, y_cnn_mm, X_lstm_mm, y_lstm_mm
+
+    n_cnn, n_lstm = cnn_offset, lstm_offset
+    logger.info("데이터 수집 완료(디스크) — CNN: %d 샘플, LSTM: %d 샘플", n_cnn, n_lstm)
+
+    y_cnn_arr = np.load(out_paths["y_cnn"], mmap_mode="r")
+    if len(y_cnn_arr) > 0:
+        unique, counts = np.unique(y_cnn_arr, return_counts=True)
+        dist = {str(u): f"{c/counts.sum():.2%}" for u, c in zip(unique, counts)}
+        logger.info("CNN 라벨 분포: %s", dist)
+
+    return {**out_paths, "n_cnn": n_cnn, "n_lstm": n_lstm}
 
 
 # ── 아키텍처 탐색 ──────────────────────────────────────────────────────────────
@@ -233,17 +357,30 @@ def load_arch_params() -> tuple[dict, dict]:
 
 # ── WFV 학습 ─────────────────────────────────────────────────────────────────
 
-def run_c_wfv(cnn_params: dict | None = None, lstm_params: dict | None = None) -> list[dict]:
+def run_c_wfv(
+    cnn_params: dict | None = None,
+    lstm_params: dict | None = None,
+    test_years: list[int] | None = None,
+) -> list[dict]:
     """
     Agent C WFV 5-fold 학습.
     각 fold: 2014~train_end_year 학습 → test_year 신호 생성.
 
+    test_years를 안 주면 WFV_CONFIG["test_years"] 그대로 쓴다 — 앞부분 fold를
+    건너뛰고 싶으면(예: [y for y in WFV_CONFIG["test_years"] if y >= 2019])
+    직접 넘기면 된다. fold 번호는 이 리스트 기준으로 1부터 다시 매겨진다.
+
     체크포인트 (중단 후 재시작 지원):
     ① signals_c_fold{N}.parquet 존재 → fold 완전 완료, 스킵
     ② cnn/lstm_signal_c_fold{N}.pt 존재 → 학습 완료, 신호 생성만 재개
+    ③ 학습 도중(25에폭마다) cnn/lstm_ckpt_fold{N}.ckpt에 저장 — 전체 200에폭을
+       못 채우고 중단돼도 마지막 체크포인트 에폭부터 이어서 학습한다.
     """
     c_start = WFV_CONFIG["c_train_start"]  # 2014
     device  = _get_device()
+
+    if test_years is None:
+        test_years = WFV_CONFIG["test_years"]
 
     if cnn_params is None or lstm_params is None:
         cnn_params, lstm_params = load_arch_params()
@@ -253,7 +390,7 @@ def run_c_wfv(cnn_params: dict | None = None, lstm_params: dict | None = None) -
 
     all_metrics: list[dict] = []
 
-    for i, test_year in enumerate(WFV_CONFIG["test_years"]):
+    for i, test_year in enumerate(test_years):
         sig_path       = RESULTS_DIR / f"signals_c_fold{i+1}.parquet"
         cnn_fold_path  = SAVED_DIR   / f"cnn_signal_c_fold{i+1}.pt"
         lstm_fold_path = SAVED_DIR   / f"lstm_signal_c_fold{i+1}.pt"
@@ -300,8 +437,16 @@ def run_c_wfv(cnn_params: dict | None = None, lstm_params: dict | None = None) -
                 continue
             n_cnn  = len(X_cnn)
             n_lstm = len(X_lstm)
-            cnn_model  = train_cnn(X_cnn,  y_cnn,  arch_params=cnn_params,  epochs=200, device_str=device)
-            lstm_model = train_lstm(X_lstm, y_lstm, arch_params=lstm_params, epochs=200, device_str=device)
+            cnn_ckpt_path  = SAVED_DIR / f"cnn_ckpt_fold{i+1}.ckpt"
+            lstm_ckpt_path = SAVED_DIR / f"lstm_ckpt_fold{i+1}.ckpt"
+            cnn_model  = train_cnn(
+                X_cnn,  y_cnn,  arch_params=cnn_params,  epochs=200, device_str=device,
+                checkpoint_path=str(cnn_ckpt_path), checkpoint_every=25,
+            )
+            lstm_model = train_lstm(
+                X_lstm, y_lstm, arch_params=lstm_params, epochs=200, device_str=device,
+                checkpoint_path=str(lstm_ckpt_path), checkpoint_every=25,
+            )
             # 학습 완료 즉시 저장 → 재시작 시 체크포인트 ②로 복원
             save_cnn(cnn_model,   str(cnn_fold_path))
             save_lstm(lstm_model, str(lstm_fold_path))
@@ -412,16 +557,34 @@ def generate_signals_for_period(
     return pd.DataFrame(rows)
 
 
-def run_c_wfv_bin(cnn_params: dict | None = None, lstm_params: dict | None = None) -> list[dict]:
+def run_c_wfv_bin(
+    cnn_params: dict | None = None,
+    lstm_params: dict | None = None,
+    test_years: list[int] | None = None,
+    c_start: int | None = None,
+    test_period_overrides: dict[int, tuple[str, str]] | None = None,
+) -> list[dict]:
     """
     Agent C 이진분류 WFV (K=2.0, n_classes=2).
     기존 ATR 3클래스 모델과 완전히 분리된 별도 파일 저장.
 
+    c_start/test_years를 안 주면 WFV_CONFIG 기본값을 쓴다 — 2026-07-17 최종
+    확정 구조(train_start=2014 고정, fold1=2019 테스트 ~ 마지막 fold는 반기만
+    테스트)처럼 커스텀 구조가 필요하면 명시적으로 넘긴다.
+    test_period_overrides: {test_year: (start_date, end_date)} — 특정
+    fold의 테스트 구간을 전체 연도가 아닌 다른 범위로 바꾸고 싶을 때 사용
+    (예: 마지막 fold를 2026년 상반기만 테스트).
+
     체크포인트:
     ① signals_c_bin_fold{N}.parquet 존재 → 완전 완료, 스킵
     ② cnn/lstm_signal_c_bin_fold{N}.pt 존재 → 학습 스킵, 신호 생성만 재개
+    ③ 학습 도중(25에폭마다) cnn/lstm_ckpt_bin_fold{N}.ckpt에 저장
     """
-    c_start = WFV_CONFIG["c_train_start"]
+    if c_start is None:
+        c_start = WFV_CONFIG["c_train_start"]
+    if test_years is None:
+        test_years = WFV_CONFIG["test_years"]
+    test_period_overrides = test_period_overrides or {}
     device  = _get_device()
 
     if cnn_params is None or lstm_params is None:
@@ -436,7 +599,7 @@ def run_c_wfv_bin(cnn_params: dict | None = None, lstm_params: dict | None = Non
 
     all_metrics: list[dict] = []
 
-    for i, test_year in enumerate(WFV_CONFIG["test_years"]):
+    for i, test_year in enumerate(test_years):
         sig_path       = RESULTS_DIR / f"signals_c_bin_fold{i+1}.parquet"
         cnn_fold_path  = SAVED_DIR   / f"cnn_signal_c_bin_fold{i+1}.pt"
         lstm_fold_path = SAVED_DIR   / f"lstm_signal_c_bin_fold{i+1}.pt"
@@ -448,8 +611,11 @@ def run_c_wfv_bin(cnn_params: dict | None = None, lstm_params: dict | None = Non
             continue
 
         train_end = test_year - 1
-        logger.info("=== [BIN] Agent C Fold %d: %d~%d 학습 → %d 테스트 ===",
-                    i + 1, c_start, train_end, test_year)
+        test_start, test_end = test_period_overrides.get(
+            test_year, (f"{test_year}-01-01", f"{test_year}-12-31")
+        )
+        logger.info("=== [BIN] Agent C Fold %d: %d~%d 학습 → %s~%s 테스트 ===",
+                    i + 1, c_start, train_end, test_start, test_end)
 
         from data.build_universe import get_all_tickers_until
         tickers = get_all_tickers_until(train_end)
@@ -469,12 +635,21 @@ def run_c_wfv_bin(cnn_params: dict | None = None, lstm_params: dict | None = Non
                 cnn_model = lstm_model = None
 
         if cnn_model is None:
-            X_cnn, y_cnn, X_lstm, y_lstm = collect_all_ohlcv(
-                tickers, c_start, train_end, label_fn=generate_labels_bin
+            paths = collect_all_ohlcv_streaming(
+                tickers, c_start, train_end,
+                cache_dir=STREAM_CACHE_DIR / f"bin_fold{i+1}",
+                label_fn=generate_labels_bin,
             )
-            if len(X_cnn) == 0 or len(X_lstm) == 0:
+            n_cnn, n_lstm = paths["n_cnn"], paths["n_lstm"]
+            if n_cnn == 0 or n_lstm == 0:
                 logger.warning("Fold %d [bin]: 데이터 없음 — 스킵", i + 1)
                 continue
+
+            # mmap_mode="r" — 배치에 필요한 부분만 디스크에서 페이징(전체를 RAM에 안 올림)
+            X_cnn  = np.load(paths["X_cnn"],  mmap_mode="r")
+            y_cnn  = np.load(paths["y_cnn"],  mmap_mode="r")
+            X_lstm = np.load(paths["X_lstm"], mmap_mode="r")
+            y_lstm = np.load(paths["y_lstm"], mmap_mode="r")
 
             # 라벨 분포 출력
             for name, y in [("CNN", y_cnn), ("LSTM", y_lstm)]:
@@ -482,9 +657,29 @@ def run_c_wfv_bin(cnn_params: dict | None = None, lstm_params: dict | None = Non
                 dist = {("Buy" if v == 1 else "NoBuy"): f"{c/len(y):.1%}" for v, c in zip(vals, counts)}
                 logger.info("%s 라벨 분포: %s", name, dist)
 
-            n_cnn, n_lstm = len(X_cnn), len(X_lstm)
-            cnn_model  = train_cnn(X_cnn,  y_cnn,  arch_params=cnn_params_bin,  epochs=200, device_str=device)
-            lstm_model = train_lstm(X_lstm, y_lstm, arch_params=lstm_params_bin, epochs=200, device_str=device)
+            cnn_ckpt_path  = SAVED_DIR / f"cnn_ckpt_bin_fold{i+1}.ckpt"
+            lstm_ckpt_path = SAVED_DIR / f"lstm_ckpt_bin_fold{i+1}.ckpt"
+            # batch_size 기본값(256)이면 fold1 기준 415만 샘플/에폭 → 배치 1.6만개나
+            # 돼서 배치당 파이썬/GPU 동기화 오버헤드가 누적돼 에폭당 12분(200에폭이면
+            # 40시간)까지 걸렸다(2026-07-17 실측). 배치 크기를 키워 배치 수 자체를
+            # 줄인다 — 모델이 작아 이 정도 배치는 GPU 메모리 문제 없음.
+            # 조기 종료(2026-07-17 도입) — 실험 반복 속도를 위해 200에폭을 다
+            # 채우지 않고, "학습이 실제로 되고 있다"고 확인된 뒤(랜덤추측 loss의
+            # 90% 밑) 20에폭 연속 개선이 없으면 멈춘다. 이 확인 전까지는 절대
+            # 멈추지 않아서 "학습 자체가 안 되는" 실패 상태를 조기종료로
+            # 착각하는 일은 없다.
+            cnn_model  = train_cnn(
+                X_cnn,  y_cnn,  arch_params=cnn_params_bin,  epochs=200, device_str=device,
+                batch_size=4096,
+                checkpoint_path=str(cnn_ckpt_path), checkpoint_every=25,
+                early_stopping_patience=20,
+            )
+            lstm_model = train_lstm(
+                X_lstm, y_lstm, arch_params=lstm_params_bin, epochs=200, device_str=device,
+                batch_size=4096,
+                checkpoint_path=str(lstm_ckpt_path), checkpoint_every=25,
+                early_stopping_patience=20,
+            )
             save_cnn(cnn_model,   str(cnn_fold_path))
             save_lstm(lstm_model, str(lstm_fold_path))
             logger.info("Fold %d [bin] 모델 저장 완료", i + 1)
@@ -492,8 +687,8 @@ def run_c_wfv_bin(cnn_params: dict | None = None, lstm_params: dict | None = Non
         signals_df = generate_signals_for_period(
             cnn_model, lstm_model,
             tickers=tickers,
-            start=f"{test_year}-01-01",
-            end=f"{test_year}-12-31",
+            start=test_start,
+            end=test_end,
             alpha=0.5,
             bin_mode=True,
         )

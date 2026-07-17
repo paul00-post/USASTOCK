@@ -78,7 +78,13 @@ _DEBT_CONCEPTS = ["LongTermDebtNoncurrent", "LongTermDebtCurrent", "LongTermDebt
 _FLOW_CONCEPTS: dict[str, list[str]] = {
     "revenue":          ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet"],
     "op_profit":        ["OperatingIncomeLoss"],
-    "net_income":       ["NetIncomeLoss"],
+    # NetIncomeLoss 하나만 후보로 뒀더니 REIT·비지배지분 있는 회사들이 통째로
+    # 빠졌다(2026-07-16, ITW/MNST/SPG/TFC 등 10개 종목이 "재무데이터 없음"으로
+    # 스킵된 걸 보고 발견 — 실제로는 SEC 원본에 수백 개 개념이 있는데 net_income
+    # 앵커가 비어서 전체가 버려졌었음). ProfitLoss(비지배지분 포함 총순이익),
+    # NetIncomeLossAvailableToCommonStockholdersBasic(REIT가 흔히 쓰는 보통주
+    # 귀속 순이익)을 폴백으로 추가.
+    "net_income":       ["NetIncomeLoss", "ProfitLoss", "NetIncomeLossAvailableToCommonStockholdersBasic"],
     "tax_expense":      ["IncomeTaxExpenseBenefit"],
     "interest_expense": ["InterestExpense", "InterestExpenseDebt"],
     "gross_profit":     ["GrossProfit"],
@@ -428,10 +434,16 @@ def get_latest_financials(ticker: str, ref_date: str | pd.Timestamp) -> pd.Serie
     return valid.sort_values("publish_date").iloc[-1]
 
 
-def run_collection(tickers: list[str] | None = None) -> None:
+def run_collection(tickers: list[str] | None = None, skip_existing: bool = True) -> None:
     """
     지정 종목(None이면 S&P500 역사적 합집합) SEC 재무 데이터 수집.
     과거에 편입됐다가 빠진 종목도 포함하여 백테스팅 생존편향을 방지.
+
+    skip_existing=True(기본값)면 이미 dart_cache/{ticker}.parquet가 있는
+    종목은 건너뛴다 — 상장폐지 종목은 CIK 조회 결과 자체가 캐시되지 않아서
+    (Tiingo 이름 힌트 호출은 75초 지연이 걸림) 중단 후 재시작 시 이미 끝난
+    종목까지 매번 그 지연을 반복하는 걸 막기 위함(2026-07-16, 전체 1131종목
+    수집 도중 발견). 최신 데이터로 강제 갱신하려면 skip_existing=False.
     """
     if tickers is None:
         from data.build_universe import get_all_tickers_until
@@ -440,6 +452,9 @@ def run_collection(tickers: list[str] | None = None) -> None:
 
     failed = []
     for i, ticker in enumerate(tickers, 1):
+        if skip_existing and (DART_CACHE_DIR / f"{ticker}.parquet").exists():
+            logger.debug("[%d/%d] %s: 이미 수집됨 — 스킵", i, len(tickers), ticker)
+            continue
         logger.info("[%d/%d] %s 수집 중...", i, len(tickers), ticker)
         try:
             collect_ticker(ticker)

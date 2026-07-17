@@ -5,6 +5,10 @@
 models/saved/*.pt
 models/saved/*.pkl
 models/saved/*.json
+models/saved/*.ckpt
+
+# Agent C 학습용 디스크 스트리밍 캐시 (fold당 수십GB, 전부 재수집 가능)
+models/cache_c/
 
 # 캐시 데이터 (용량 큰 바이너리, 전부 재수집 가능) — 2026-07-16 데이터 수집
 # 테스트 중 실제로 생성돼 누락이 확인된 경로 추가(price_cache_meta, SEC 필링

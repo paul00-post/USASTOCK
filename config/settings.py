@@ -204,7 +204,7 @@ AGENT_B_FEATURES: list[str] = (
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 CNN_CONFIG = {
-    "window":   10,
+    "window":   100,  # 2026-07-17 최종 확정: 3클래스 10일 → 이진분류 100영업일로 변경
     "channels": ["open", "high", "low", "close", "volume"],
 }
 
@@ -218,9 +218,9 @@ LSTM_FEATURES: list[str] = [
 ]
 
 LSTM_CONFIG = {
-    "window":     20,
+    "window":     100,  # 2026-07-17 최종 확정: 20일 → 이진분류 100영업일로 변경 (CNN과 동일)
     "n_features": len(LSTM_FEATURES),  # 17
-    "n_classes":  3,                   # Buy=0, Hold=1, Sell=2
+    "n_classes":  3,                   # Buy=0, Hold=1, Sell=2 — 3클래스 경로 기본값, 이진 경로는 run_c_wfv_bin이 n_classes=2로 별도 오버라이드
     "min_epochs": 200,
 }
 

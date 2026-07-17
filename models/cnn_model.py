@@ -43,22 +43,45 @@ class CNN1DDataset(Dataset):
     """
     CNN-1D 학습 데이터셋.
 
-    X : (샘플 수, 채널 수=5, 윈도우) float32
+    X : (샘플 수, 채널 수=5, 윈도우) float32 — 일반 ndarray 또는 np.memmap
     y : (샘플 수,) long (0=Buy, 1=Hold, 2=Sell)
+
+    X를 __init__에서 통째로 torch.tensor로 변환하지 않고 __getitem__에서
+    행 단위로만 변환한다 — X가 np.memmap(디스크 기반)일 때 여기서 전체를
+    한 번에 텐서화하면 결국 전체를 RAM에 올리는 것과 같아져서, 전종목
+    데이터가 RAM(16GB)을 초과해 죽는 문제(2026-07-17 실제 확인)가 그대로
+    재현된다. 행 단위 지연 변환이라야 memmap의 이점(필요한 부분만 페이징)이
+    실제로 산다.
     """
 
     def __init__(self, X: np.ndarray, y: np.ndarray, window: int = WINDOW):
         assert X.shape[1:] == (N_CHANNELS, window), (
             f"X shape 오류: 기대 (N, {N_CHANNELS}, {window}), 실제 {X.shape}"
         )
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.long)
+        self.X = X
+        self.y = y
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        x = torch.tensor(np.asarray(self.X[idx]), dtype=torch.float32)
+        y = torch.tensor(int(self.y[idx]), dtype=torch.long)
+        return x, y
+
+    def __getitems__(self, indices: list[int]):
+        """
+        DataLoader가 배치 인덱스 리스트를 한 번에 넘겨주면(auto_collation) 이
+        메서드가 __getitem__ 반복 호출보다 우선 사용된다(PyTorch 지원 프로토콜).
+        인덱스 개수만큼 __getitem__을 파이썬 루프로 호출하는 대신 메모리맵을
+        한 번의 팬시 인덱싱으로 읽고 텐서 변환도 배치 전체를 한 번만 하므로,
+        배치당 오버헤드가 훨씬 작다 — 2026-07-17 실측: 이게 없어서 batch_size를
+        256→4096으로 올려도(옵티마이저 스텝 수만 줄어들 뿐 __getitem__ 호출
+        415만 번은 그대로라) GPU 사용률 0%로 여전히 느렸음.
+        """
+        Xb = torch.tensor(np.asarray(self.X[indices]), dtype=torch.float32)
+        yb = torch.tensor(np.asarray(self.y[indices]), dtype=torch.long)
+        return list(zip(Xb, yb))
 
 
 class CNN1DModel(nn.Module):
@@ -305,6 +328,8 @@ def train_cnn(
     device_str:      str  = "cpu",
     checkpoint_path: str | None = None,
     checkpoint_every: int = 25,
+    early_stopping_patience: int | None = None,
+    early_stopping_min_delta: float = 1e-3,
 ) -> CNN1DModel:
     """
     CNN-1D 학습.
@@ -314,17 +339,26 @@ def train_cnn(
     arch_params      : CNN_ARCH_SEARCH 범위 내 파라미터 (None이면 기본값)
     checkpoint_path  : 체크포인트 저장 경로 (.ckpt). None이면 저장 안 함.
     checkpoint_every : N 에폭마다 체크포인트 저장 (기본 25)
+    early_stopping_patience : 이 값을 주면 실제로 조기 종료한다(기존엔 로그만
+        찍고 안 멈췄음, 2026-07-17). 다만 loss가 "그냥 다수 클래스만 찍는"
+        랜덤 추측 수준(ln(n_classes))보다 확실히 낮아지기 전까지는 patience를
+        세지 않는다 — 안 그러면 학습이 아예 안 되는 실패 상태(국내 프로젝트에서
+        실제로 겪은 문제)에서 "안 좋아지네" 하고 일찍 멈춰버리는 정반대 결과가
+        나올 수 있다.
+    early_stopping_min_delta : 이보다 적게 개선되면 "개선 없음"으로 친다.
     """
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
 
     if arch_params is None:
         arch_params = {}
 
+    n_classes_used = arch_params.get("n_classes", N_CLASSES)
     model = CNN1DModel(
         num_conv_layers=arch_params.get("num_conv_layers", 2),
         num_filters=arch_params.get("num_filters", 64),
         kernel_size=arch_params.get("kernel_size", 3),
         dropout=arch_params.get("dropout", 0.2),
+        n_classes=n_classes_used,
     ).to(device)
 
     dataset    = CNN1DDataset(X_train, y_train, window=X_train.shape[2])
@@ -334,6 +368,12 @@ def train_cnn(
 
     start_epoch = 1
     ckpt_path   = Path(checkpoint_path) if checkpoint_path else None
+
+    # 랜덤 추측 loss(ln(n_classes))보다 확실히(10%) 낮아져야 "학습이 실제로
+    # 되고 있다"고 보고 그때부터만 조기 종료 patience를 센다.
+    learning_confirmed_threshold = np.log(n_classes_used) * 0.9
+    best_loss = float("inf")
+    epochs_no_improve = 0
 
     if ckpt_path and ckpt_path.exists():
         ckpt = torch.load(ckpt_path, map_location=device)
@@ -358,8 +398,6 @@ def train_cnn(
 
         if epoch % 10 == 0 or epoch == epochs:
             logger.info("CNN Epoch %d/%d | loss=%.4f", epoch, epochs, avg_loss)
-            if avg_loss < 0.5:
-                logger.info("Loss 충분히 수렴 — 조기 종료 가능")
 
         if ckpt_path and epoch % checkpoint_every == 0:
             torch.save({
@@ -367,6 +405,19 @@ def train_cnn(
                 "model_state_dict":     model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
             }, ckpt_path)
+
+        if early_stopping_patience is not None and avg_loss < learning_confirmed_threshold:
+            if avg_loss < best_loss - early_stopping_min_delta:
+                best_loss = avg_loss
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+            if epochs_no_improve >= early_stopping_patience:
+                logger.info(
+                    "CNN 조기 종료: Epoch %d/%d, loss=%.4f (patience=%d 도달)",
+                    epoch, epochs, avg_loss, early_stopping_patience,
+                )
+                break
 
     if ckpt_path and ckpt_path.exists():
         ckpt_path.unlink()
@@ -392,6 +443,7 @@ def load_cnn(arch_params: dict | None = None, path: str | None = None) -> CNN1DM
         num_filters=arch_params.get("num_filters", 64),
         kernel_size=arch_params.get("kernel_size", 3),
         dropout=arch_params.get("dropout", 0.2),
+        n_classes=arch_params.get("n_classes", N_CLASSES),
     )
     model.load_state_dict(torch.load(p, map_location="cpu"))
     model.eval()

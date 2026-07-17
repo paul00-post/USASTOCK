@@ -39,22 +39,35 @@ SELL = 2
 
 class LSTMDataset(Dataset):
     """
-    X : (N, WINDOW, N_FEATURES) float32
+    X : (N, WINDOW, N_FEATURES) float32 — 일반 ndarray 또는 np.memmap
     y : (N,) long
+
+    CNN1DDataset과 동일한 이유로 __init__에서 통째로 텐서화하지 않고
+    __getitem__에서 행 단위로만 변환한다(memmap의 지연 로딩을 실제로 살리기
+    위함 — 2026-07-17 전종목 데이터가 RAM을 초과해 죽는 문제 확인 후 도입).
     """
 
     def __init__(self, X: np.ndarray, y: np.ndarray, window: int = WINDOW):
         assert X.shape[1:] == (window, N_FEATURES), (
             f"X shape 오류: 기대 (N, {window}, {N_FEATURES}), 실제 {X.shape}"
         )
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.long)
+        self.X = X
+        self.y = y
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        x = torch.tensor(np.asarray(self.X[idx]), dtype=torch.float32)
+        y = torch.tensor(int(self.y[idx]), dtype=torch.long)
+        return x, y
+
+    def __getitems__(self, indices: list[int]):
+        """CNN1DDataset.__getitems__와 동일한 이유(배치 단위 memmap 접근 +
+        일괄 텐서 변환)로 도입 — batch_size만 키워서는 효과가 없었음(2026-07-17)."""
+        Xb = torch.tensor(np.asarray(self.X[indices]), dtype=torch.float32)
+        yb = torch.tensor(np.asarray(self.y[indices]), dtype=torch.long)
+        return list(zip(Xb, yb))
 
 
 class LSTMModel(nn.Module):
@@ -305,24 +318,32 @@ def train_lstm(
     device_str:       str   = "cpu",
     checkpoint_path:  str | None = None,
     checkpoint_every: int = 25,
+    early_stopping_patience: int | None = None,
+    early_stopping_min_delta: float = 1e-3,
 ) -> LSTMModel:
-    """LSTM 학습. 최소 200 에폭, loss > ln(3) 이면 경고.
+    """LSTM 학습. 최소 200 에폭, loss > ln(n_classes) 이면 경고.
 
     Parameters
     ----------
     checkpoint_path  : 체크포인트 저장 경로 (.ckpt). None이면 저장 안 함.
     checkpoint_every : N 에폭마다 체크포인트 저장 (기본 25)
+    early_stopping_patience : CNN1DModel.train_cnn과 동일한 방식의 조기 종료
+        (2026-07-17 도입) — "다수 클래스만 찍는" 랜덤 추측 수준(ln(n_classes))
+        보다 확실히 낮아지기 전까지는 patience를 세지 않는다.
+    early_stopping_min_delta : 이보다 적게 개선되면 "개선 없음"으로 친다.
     """
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
 
     if arch_params is None:
         arch_params = {}
 
+    n_classes_used = arch_params.get("n_classes", N_CLASSES)
     model = LSTMModel(
         n_features=arch_params.get("n_features", N_FEATURES),
         hidden_size=arch_params.get("hidden_size", 64),
         num_layers=arch_params.get("num_layers", 1),
         dropout=arch_params.get("dropout", 0.2),
+        n_classes=n_classes_used,
     ).to(device)
 
     dataset    = LSTMDataset(X_train, y_train, window=X_train.shape[1])
@@ -331,8 +352,13 @@ def train_lstm(
     criterion  = nn.CrossEntropyLoss()
 
     start_epoch = 1
-    final_loss  = np.log(N_CLASSES)
+    random_guess_loss = np.log(n_classes_used)
+    final_loss  = random_guess_loss
     ckpt_path   = Path(checkpoint_path) if checkpoint_path else None
+
+    learning_confirmed_threshold = random_guess_loss * 0.9
+    best_loss = float("inf")
+    epochs_no_improve = 0
 
     if ckpt_path and ckpt_path.exists():
         ckpt = torch.load(ckpt_path, map_location=device)
@@ -356,7 +382,7 @@ def train_lstm(
 
         final_loss = total_loss / len(dataset)
         if epoch % 10 == 0 or epoch == epochs:
-            logger.info("LSTM Epoch %d/%d | loss=%.4f (ln(3)=1.099)", epoch, epochs, final_loss)
+            logger.info("LSTM Epoch %d/%d | loss=%.4f (랜덤추측=%.4f)", epoch, epochs, final_loss, random_guess_loss)
 
         if ckpt_path and epoch % checkpoint_every == 0:
             torch.save({
@@ -365,14 +391,28 @@ def train_lstm(
                 "optimizer_state_dict": optimizer.state_dict(),
             }, ckpt_path)
 
+        if early_stopping_patience is not None and final_loss < learning_confirmed_threshold:
+            if final_loss < best_loss - early_stopping_min_delta:
+                best_loss = final_loss
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+            if epochs_no_improve >= early_stopping_patience:
+                logger.info(
+                    "LSTM 조기 종료: Epoch %d/%d, loss=%.4f (patience=%d 도달)",
+                    epoch, epochs, final_loss, early_stopping_patience,
+                )
+                break
+
     if ckpt_path and ckpt_path.exists():
         ckpt_path.unlink()
 
-    # 학습 실패 경고
-    ln3 = np.log(N_CLASSES)
-    if final_loss >= ln3 * 0.98:
+    # 학습 실패 경고 — 이 모델의 실제 n_classes 기준(예전엔 항상 ln(3) 기준이라
+    # 이진분류(n_classes=2)에서 기준 자체가 틀려있었음, 2026-07-17 수정)
+    if final_loss >= random_guess_loss * 0.98:
         logger.warning(
-            "LSTM 학습 실패 의심: 최종 loss=%.4f ≈ ln(3)=%.4f. 에폭 수 증가 권장.", final_loss, ln3
+            "LSTM 학습 실패 의심: 최종 loss=%.4f ≈ 랜덤추측=%.4f. 에폭 수 증가 권장.",
+            final_loss, random_guess_loss,
         )
 
     return model
@@ -395,6 +435,7 @@ def load_lstm(arch_params: dict | None = None, path: str | None = None) -> LSTMM
         hidden_size=arch_params.get("hidden_size", 64),
         num_layers=arch_params.get("num_layers", 1),
         dropout=arch_params.get("dropout", 0.2),
+        n_classes=arch_params.get("n_classes", N_CLASSES),
     )
     model.load_state_dict(torch.load(p, map_location="cpu"))
     model.eval()

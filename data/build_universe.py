@@ -57,6 +57,7 @@ UNMATCHED_CSV     = DATA_DIR / "universe_name_unmatched.csv"    # 자동 생성 
 _REQUEST_DELAY   = 0.2   # SEC 요청 간격 (초)
 _TICKER_MAP_TTL_DAYS = 30
 _FUZZY_CUTOFF    = 0.88  # 참고용 제안 임계값 (자동 반영 안 함)
+_MAX_PLAUSIBLE_HOLDINGS = 800  # 이보다 많으면 다른 펀드 데이터 혼입으로 간주(build_universe 참고)
 
 # N-CSR로 전환된 시점 근방 — 이 날짜 이전 필링은 고정폭 텍스트(.txt),
 # 이후는 HTML로 간주(2026-07-16, 실제 필링 몇 건 열어보고 확인한 경계).
@@ -191,7 +192,12 @@ def _parse_legacy_text(text: str) -> list[str]:
 
     start_idx = None
     for i, l in enumerate(lines):
-        if "COMMON STOCKS (" in l.upper():
+        upper = l.upper()
+        # "TOTAL COMMON STOCKS ("(재무 하이라이트 요약 줄)도 "COMMON STOCKS ("를
+        # 부분 문자열로 포함하므로, 진짜 보유종목 표 헤더보다 앞서 나오는 요약
+        # 줄에 잘못 걸리지 않도록 TOTAL 접두 줄은 제외한다(2026-07-16, 2019년
+        # 필링에서 실제로 이 요약 줄에 먼저 걸려 보유종목 0개가 추출된 사례 확인).
+        if "COMMON STOCKS (" in upper and "TOTAL COMMON STOCKS (" not in upper:
             start_idx = i + 1
             break
     if start_idx is None:
@@ -229,6 +235,18 @@ def _parse_legacy_text(text: str) -> list[str]:
 
 # ── 3-B. 현대 HTML(N-CSR, 2003년경~) 파싱 ─────────────────────────────────────
 
+_NUMERIC_CELL_RE = re.compile(r"^[\d,]+$")
+_MARKER_CELL_RE  = re.compile(r"^[\*\^,\s]+$")   # 각주 마커(*, ^, *,^ 등)만 있는 셀
+_SECTION_HDR_RE  = re.compile(r"\(\d+\.?\d*%\)")  # "Common Stocks (99.8%)", "Basic Materials (3.6%)" 등
+# 표가 인쇄 페이지 단위로 쪼개질 때마다 반복되는 컬럼 헤더 조각들(연도별로
+# "Value•"/"Value"처럼 살짝 다르게 나올 수 있어 우측 각주기호는 벗겨내고 비교).
+_HEADER_STOPWORDS = {"Market", "Value", "Shares", "($000", "(000", ")", "$000"}
+
+
+def _clean_header_token(t: str) -> str:
+    return t.rstrip("•*^, ")
+
+
 def _parse_modern_html(html: str) -> list[str]:
     """
     N-CSR HTML에서 500 Index Fund "Common Stocks" 표의 회사명 목록 추출.
@@ -236,12 +254,29 @@ def _parse_modern_html(html: str) -> list[str]:
     이 표는 pandas.read_html로 한 번에 못 읽는다 — Vanguard가 페이지 단위로
     <table>을 여러 개로 쪼개놓기 때문. "Common Stocks (" 텍스트가 있는 표를
     시작점으로 잡고, 이후 모든 <table>을 순서대로 훑으며 "Total Common
-    Stocks" 행이 나올 때까지 4-셀 행([마커, 회사명, 주수, 평가액])만 수집한다.
-    회사명이 길어 두 행에 걸쳐 나뉘는 경우(주수·평가액 칸이 비어있는 행)는
+    Stocks" 행이 나올 때까지 데이터 행만 수집한다.
+
+    셀 개수는 연도별로 다르다(2026-07-16 실제 확인 — 2024~2025년 필링은
+    [마커, 회사명, 주수, 평가액] 4셀이지만, 2018~2020년 필링은 회사명·주수·
+    평가액 사이에 빈 정렬용 셀이 여러 개 끼어들어 총 9~11셀이다). 그래서
+    셀 "개수"가 아니라 "내용"으로 판단한다 — 빈 문자열을 걷어낸 뒤, 숫자
+    (주수·평가액)도 각주 마커(*, ^)도 아닌 텍스트가 정확히 1개 남으면 그게
+    회사명이다. 페이지 경계마다 반복되는 컬럼 헤더 조각("Market"/"Shares"
+    등)은 별도 스톱워드로 걸러낸다 — 공백 포함 여부로 걸렀더니 "Aramark"·
+    "KeyCorp"처럼 한 단어짜리 실제 회사명까지 같이 걸러지는 문제가 있었다.
+    회사명이 길어 두 행에 걸쳐 나뉘는 경우(그 행에 숫자가 아직 안 나옴)는
     다음 행과 합친다.
     """
     soup = BeautifulSoup(html, "html.parser")
-    start_node = soup.find(string=re.compile(r"Common Stocks \("))
+    # "Total Common Stocks (Cost $...)"(재무 하이라이트 요약 줄)도 "Common
+    # Stocks (" 부분 문자열을 포함해서, 진짜 보유종목 표 헤더("Common Stocks
+    # (99.8%)")보다 앞서 나오는 요약 표에 잘못 걸릴 수 있다 — "Total "로
+    # 시작하지 않고 괄호 바로 뒤가 숫자(비중 %)인 것만 진짜 헤더로 인정한다
+    # (2026-07-16, 2019년 필링에서 실제로 요약 줄에 걸려 보유종목 0개 추출
+    # 확인 — Common Stocks 텍스트는 찾았는데 그 표 안에 종목 행이 없었음).
+    # 2005년 전후 필링은 "COMMON STOCKS" 전부 대문자라 대소문자 무시 필수
+    # (2026-07-16 확인 — 대소문자 구분했더니 아예 섹션을 못 찾았음).
+    start_node = soup.find(string=re.compile(r"(?<!Total )Common Stocks \(\d", re.IGNORECASE))
     if start_node is None:
         raise ValueError("Common Stocks 섹션 시작을 못 찾음")
     start_table = start_node.find_parent("table")
@@ -257,19 +292,29 @@ def _parse_modern_html(html: str) -> list[str]:
             if not cells:
                 continue
             texts = [c.get_text(strip=True) for c in cells]
-            if texts and "Total Common Stocks" in texts[0]:
+            non_empty = [t for t in texts if t]
+            if not non_empty:
+                continue
+            if "total common stocks" in " ".join(non_empty).lower():
                 stop = True
                 break
-            if len(texts) != 4:
+            if any(_SECTION_HDR_RE.search(t) for t in non_empty):
+                continue  # "Common Stocks (99.8%)", 섹터 소제목 등 — 데이터 행 아님
+            numeric = [t for t in non_empty if _NUMERIC_CELL_RE.match(t)]
+            name_candidates = [
+                t for t in non_empty
+                if not _NUMERIC_CELL_RE.match(t)
+                and not _MARKER_CELL_RE.match(t)
+                and _clean_header_token(t) not in _HEADER_STOPWORDS
+            ]
+            if len(name_candidates) != 1:
                 continue
-            name_cell = texts[1]
-            if not name_cell:
-                continue
+            name_cell = name_candidates[0]
             if pending:
                 name_cell = f"{pending} {name_cell}"
                 pending = None
-            if not texts[2] and not texts[3]:
-                # 주수·평가액이 비어있음 → 회사명이 다음 행에 이어짐
+            if len(numeric) < 2:
+                # 주수·평가액이 아직 안 나옴 → 회사명이 다음 행에 이어짐
                 pending = name_cell
                 continue
             names.append(name_cell)
@@ -277,6 +322,18 @@ def _parse_modern_html(html: str) -> list[str]:
             break
 
     return names
+
+
+def _fetch_full_submission_txt(filing: dict) -> str:
+    """전체 제출물(.txt) 원문 직접 조회 — index.json이 없거나 모던 HTML
+    파서가 기대한 표 구조가 아닌 필링에 대한 최후 수단 폴백(캐시하지 않음,
+    발생 빈도가 낮아 재수집 비용이 크지 않음)."""
+    cik_int = str(int(VANGUARD_500_CIK))
+    url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{filing['accession']}.txt"
+    time.sleep(_REQUEST_DELAY)
+    resp = requests.get(url, headers=_headers(), timeout=60)
+    resp.raise_for_status()
+    return resp.text
 
 
 def _fund_holdings_or_none(filing: dict) -> list[str] | None:
@@ -293,10 +350,22 @@ def _fund_holdings_or_none(filing: dict) -> list[str] | None:
     이전 코드는 그 날짜의 첫 accession을 무조건 500펀드로 가정해서 실제로는
     이 형제 펀드의 보유종목을 S&P500 스냅샷으로 잘못 저장하고 있었다.
     """
-    text, is_legacy = _fetch_filing_document(filing)
-    if not re.search(r"500 Index Fund", text, re.IGNORECASE):
-        return None
-    return _parse_legacy_text(text) if is_legacy else _parse_modern_html(text)
+    try:
+        text, is_legacy = _fetch_filing_document(filing)
+        if not re.search(r"500 Index Fund", text, re.IGNORECASE):
+            return None
+        return _parse_legacy_text(text) if is_legacy else _parse_modern_html(text)
+    except Exception as e:
+        # 2003~2005년 일부 필링(예: 0000932471-04-000761)은 index.json이 아예
+        # 404거나, 있어도 모던 HTML 파서가 기대하는 "Common Stocks (" 표
+        # 구조가 아니다(2026-07-16 확인) — 이 경우 전체 제출물(.txt)을 받아
+        # 레거시 고정폭 파서로 재시도한다. 그래도 실패하면 그대로 전파해서
+        # 호출부(build_universe)가 이 accession을 스킵하게 한다.
+        logger.debug("%s: 기본 방식 실패(%s) — 전체 제출물(.txt)로 재시도", filing["accession"], e)
+        text = _fetch_full_submission_txt(filing)
+        if not re.search(r"500 Index Fund", text, re.IGNORECASE):
+            return None
+        return _parse_legacy_text(text)
 
 
 # ── 4. 회사명 → 티커 매칭 ─────────────────────────────────────────────────────
@@ -495,6 +564,20 @@ def build_universe(start_year: int = 2000, end_year: int | None = None) -> None:
                 continue
             if cur_names is None:
                 logger.debug("%s: 500 Index Fund 아님 — 다음 후보 시도", filing["accession"])
+                continue
+            # 500 Index Fund 필링이어도, 여러 펀드가 한 문서에 묶여 있으면 표
+            # 경계 인식이 어긋나 다른 펀드 보유종목까지 같이 긁힐 수 있다
+            # (2026-07-16, 0001104659-20-027799에서 실제로 7560개 원본 이름·
+            # 2159개 티커가 나온 사례 확인 — 500 펀드가 500~600개를 크게
+            # 넘는 건 정상 범위가 아니므로 오염된 결과로 간주하고 버린다.
+            # 잘못된 대량 데이터로 스냅샷을 오염시키느니 그 기준일을 결측으로
+            # 남기는 게 안전하다).
+            if len(cur_names) > _MAX_PLAUSIBLE_HOLDINGS:
+                logger.warning(
+                    "%s: 추출된 원본 종목 수(%d)가 500 Index Fund치고 비정상적으로 많음 "
+                    "— 다른 펀드 데이터가 섞였을 가능성, 이 accession은 버리고 다음 후보 시도",
+                    filing["accession"], len(cur_names),
+                )
                 continue
             names = cur_names
             used_accession = filing["accession"]

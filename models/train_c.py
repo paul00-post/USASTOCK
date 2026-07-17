@@ -603,6 +603,7 @@ def run_c_wfv_bin(
     test_years: list[int] | None = None,
     c_start: int | None = None,
     test_period_overrides: dict[int, tuple[str, str]] | None = None,
+    backup_dir: str | Path | None = None,
 ) -> list[dict]:
     """
     Agent C 이진분류 WFV (K=2.0, n_classes=2).
@@ -614,12 +615,20 @@ def run_c_wfv_bin(
     test_period_overrides: {test_year: (start_date, end_date)} — 특정
     fold의 테스트 구간을 전체 연도가 아닌 다른 범위로 바꾸고 싶을 때 사용
     (예: 마지막 fold를 2026년 상반기만 테스트).
+    backup_dir : 넘기면 fold 하나 끝날 때마다 그 fold의 모델(.pt)·신호
+        (signals_c_bin_fold{N}.parquet)를 이 경로 밑에 복사해둔다 — 콜랩처럼
+        세션이 끊기면 로컬 디스크가 통째로 날아가는 환경에서, 구글 드라이브
+        마운트 경로(예: "/content/drive/MyDrive/USASTOCK_backup")를 넘기면
+        fold 결과를 세션과 무관하게 안전하게 보관한다(2026-07-18 도입). 로컬
+        실행 시엔 그냥 안 넘기면 기존과 동일하게 동작한다.
 
     체크포인트:
     ① signals_c_bin_fold{N}.parquet 존재 → 완전 완료, 스킵
     ② cnn/lstm_signal_c_bin_fold{N}.pt 존재 → 학습 스킵, 신호 생성만 재개
     ③ 학습 도중(25에폭마다) cnn/lstm_ckpt_bin_fold{N}.ckpt에 저장
     """
+    if backup_dir is not None:
+        backup_dir = Path(backup_dir)
     if c_start is None:
         c_start = WFV_CONFIG["c_train_start"]
     if test_years is None:
@@ -744,6 +753,20 @@ def run_c_wfv_bin(
         all_metrics.append({"fold": i+1, "test_year": test_year,
                              "n_train_cnn": n_cnn, "n_train_lstm": n_lstm})
         logger.info("Fold %d [bin] 완료 — 신호 저장: %s", i + 1, sig_path)
+
+        if backup_dir is not None:
+            import shutil
+            try:
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                (backup_dir / "saved").mkdir(exist_ok=True)
+                (backup_dir / "results").mkdir(exist_ok=True)
+                for fp in (cnn_fold_path, lstm_fold_path):
+                    if fp.exists():
+                        shutil.copy2(fp, backup_dir / "saved" / fp.name)
+                shutil.copy2(sig_path, backup_dir / "results" / sig_path.name)
+                logger.info("Fold %d [bin] 백업 완료 → %s", i + 1, backup_dir)
+            except OSError as e:
+                logger.warning("Fold %d [bin] 백업 실패(무시하고 계속): %s", i + 1, e)
 
     return all_metrics
 

@@ -717,13 +717,12 @@ def run_c_wfv_bin(
             # 90% 밑) 20에폭 연속 개선이 없으면 멈춘다. 이 확인 전까지는 절대
             # 멈추지 않아서 "학습 자체가 안 되는" 실패 상태를 조기종료로
             # 착각하는 일은 없다.
-            # num_workers>0 — 대용량 memmap(fold1 LSTM 배열만 28GB대)에서 배치마다
-            # 무작위로 읽어오는 게 GPU 연산보다 느려서 GPU 사용률이 0%↔30%대를
-            # 왔다갔다 하는 걸 콜랩에서 실측(2026-07-17) — 별도 프로세스가 다음
-            # 배치를 미리 읽어오게 해서 이 병목을 줄인다. 윈도우는 멀티프로세싱
-            # spawn 방식이 이 launcher 스크립트 구조상 안전하지 않아 0(끔) 유지.
-            import os as _os
-            _workers = 4 if _os.name != "nt" else 0
+            # num_workers=4로 콜랩(리눅스)에서 시도했다가 오히려 멈춰버리는
+            # 문제가 발생해(2026-07-18 실측 — GPU 0%, 로그 2시간 넘게 무갱신)
+            # 다시 0(끔)으로 되돌림. 대용량 memmap 랜덤 접근이 느린 문제 자체는
+            # 남아있지만, 최소한 안 멈추는 쪽을 우선한다 — 나중에 다른 방식
+            # (예: 쓰기 시점에 종목을 섞어서 순차 읽기로 대체)으로 다시 접근.
+            _workers = 0
             cnn_model  = train_cnn(
                 X_cnn,  y_cnn,  arch_params=cnn_params_bin,  epochs=200, device_str=device,
                 batch_size=4096, num_workers=_workers, pin_memory=(device == "cuda"),

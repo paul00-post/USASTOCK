@@ -25,6 +25,7 @@ from config.settings import (
     BACKTEST_DIR,
     CNN_ARCH_SEARCH,
     LSTM_ARCH_SEARCH,
+    LSTM_FEATURES,
     MODELS_DIR,
     PRICE_START_DATE,
     WFV_CONFIG,
@@ -164,9 +165,22 @@ def collect_all_ohlcv_streaming(
     그래서 2-패스로 짠다 — 1차 패스는 종목별 라벨·시퀀스를 계산만 해서
     "몇 개 샘플이 나오는지" 개수만 세고 버린다(디스크에 아무것도 안 씀).
     그 총합으로 최종 크기의 memmap을 한 번만 할당한 뒤, 2차 패스에서 같은
-    계산을 다시 해서(가격 캐시는 로컬 parquet라 재계산 비용이 크지 않음)
-    이번엔 임시파일 없이 바로 그 memmap의 해당 위치에 적어 넣는다 — 디스크에
-    최종 파일 용량만큼만 잡힌다.
+    계산을 다시 해서 이번엔 임시파일 없이 바로 그 memmap의 해당 위치에
+    적어 넣는다 — 디스크에 최종 파일 용량만큼만 잡힌다.
+
+    2026-07-18 추가: fold끼리도 재계산을 피한다. WFV 확장 윈도우 특성상
+    fold2(train_end=2019)는 fold1(train_end=2018)의 상위집합이라 "2019년치만
+    추가"하면 되는데, 종목별 원본(가격+라벨+기술지표)을 fold의 train_end로
+    자르지 않고 그 종목의 "가용 전체 기간"으로 한 번만 계산해서
+    models/cache_c/per_ticker/{label_fn}/{ticker}.parquet에 fold와 무관하게
+    캐싱해두고, 이 fold에서는 그 캐시를 date<=train_end로 자르기만 한다
+    (자르기는 가벼운 슬라이싱이라 fold마다 다시 해도 비용이 거의 없다).
+    라벨을 fold의 train_end로 안 자르고 전체 기간으로 계산하면 그 종목
+    끝자락(예전엔 12월 데이터가 미래 10일치가 모자라 불완전하게 계산되던 문제)
+    라벨도 오히려 더 정확해진다 — 라벨은 항상 "그 샘플 시점부터 N일 뒤"만
+    보므로, 모델 입력 피처에 미래 정보가 새는 것도 아니라 lookahead 위반은
+    아니다. 신규 종목(이전 fold엔 없던 종목)은 이 함수 안에서 처음 캐시가
+    만들어지고, 그 뒤 fold부터는 그 종목도 캐시를 재사용한다.
 
     fold 재실행 시 이미 만들어진 최종 파일이 있으면 재사용(재수집 스킵).
 
@@ -192,28 +206,51 @@ def collect_all_ohlcv_streaming(
     start_str = f"{start_year}-01-01"
     end_str   = f"{end_year}-12-31"
 
-    # 종목별 원본(가격·라벨·기술지표)은 펼치기 전이라 가벼워서(종목당 1MB 안팎)
-    # 전 종목(1000+)을 캐싱해도 1~2GB 수준 — 국내 프로젝트의 "메모리 사전 로드로
-    # 반복 I/O 제거" 원칙과 동일(build_factor_dataset._preload_all 참고). RAM이
-    # 부족해 죽었던 건 "윈도우로 펼친 뒤"의 대량 배열이지 원본이 아니므로, 원본은
-    # 캐싱하고 펼치기(make_sequences/make_lstm_sequences)만 패스마다 다시 한다
-    # — 가격 재조회·라벨 재계산·기술지표 재계산을 2번 하지 않는다(2026-07-17,
-    # 이 캐싱 없이 2-패스로 짰다가 종목당 계산을 통째로 두 번 하고 있었음을 확인).
-    ticker_cache: dict[str, tuple] = {}
-    for ticker in tqdm(tickers, desc="가격/라벨/기술지표 로드"):
+    # per-ticker 캐시는 label_fn(3클래스 vs 이진)별로 분리 — 서로 다른 라벨
+    # 스킴을 같은 캐시에 섞어 쓰면 안 되므로 함수 이름으로 디렉터리를 나눈다.
+    per_ticker_dir = STREAM_CACHE_DIR / "per_ticker" / label_fn.__name__
+    per_ticker_dir.mkdir(parents=True, exist_ok=True)
+
+    def _load_or_build_ticker_frame(ticker: str) -> pd.DataFrame | None:
+        fp = per_ticker_dir / f"{ticker}.parquet"
+        if fp.exists():
+            return pd.read_parquet(fp)
+
         df = load_price_cache(ticker)
         if df is None or df.empty:
-            continue
+            return None
         df["Date"] = pd.to_datetime(df["Date"])
-        df = df[(df["Date"] >= start_str) & (df["Date"] <= end_str)].copy()
+        df = df.sort_values("Date").reset_index(drop=True)
         if len(df) < LSTM_WINDOW + 20:
-            continue
-        label_df = label_fn(df)
+            return None
+
+        label_df = label_fn(df)  # 종목의 가용 전체 기간 기준 — fold로 안 자름
         try:
-            tech_df = compute_technical_features(df)
+            tech_df = compute_technical_features(df).reset_index()
         except AssertionError as e:
             logger.warning("%s 기술 지표 계산 실패: %s", ticker, e)
-            tech_df = None
+            return None
+
+        merged = df.merge(label_df, on="Date", how="left").merge(tech_df, on="Date", how="left")
+        merged.to_parquet(fp, index=False)
+        return merged
+
+    # 종목별 원본(가격·라벨·기술지표)은 펼치기 전이라 가벼워서(종목당 1MB 안팎)
+    # 전 종목(1000+)을 메모리에 캐싱해도 1~2GB 수준 — 국내 프로젝트의 "메모리
+    # 사전 로드로 반복 I/O 제거" 원칙과 동일(build_factor_dataset._preload_all
+    # 참고). RAM이 부족해 죽었던 건 "윈도우로 펼친 뒤"의 대량 배열이지 원본이
+    # 아니므로, 원본은 이번 fold 안에서도 캐싱해서 펼치기만 패스마다 다시 한다.
+    ticker_cache: dict[str, tuple] = {}
+    for ticker in tqdm(tickers, desc="가격/라벨/기술지표 로드(종목별 캐시)"):
+        merged = _load_or_build_ticker_frame(ticker)
+        if merged is None:
+            continue
+        merged = merged[(merged["Date"] >= start_str) & (merged["Date"] <= end_str)]
+        if len(merged) < LSTM_WINDOW + 20:
+            continue
+        df       = merged[["Date", "Open", "High", "Low", "Close", "Volume"]]
+        label_df = merged[["Date", "label"]]
+        tech_df  = merged[["Date"] + LSTM_FEATURES].set_index("Date")
         ticker_cache[ticker] = (df, label_df, tech_df)
 
     # ── 1차 패스: 샘플 개수만 집계(디스크 미사용, 캐시에서 펼치기만) ────────────

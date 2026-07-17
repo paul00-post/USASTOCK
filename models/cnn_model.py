@@ -271,7 +271,8 @@ def make_sequences(
     price_df: pd.DataFrame,
     label_df: pd.DataFrame,
     window: int = WINDOW,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_dates: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     (X, y) 시퀀스 생성.
 
@@ -280,6 +281,9 @@ def make_sequences(
 
     정규화: 윈도우 내 종가 기준 (마지막 종가 = 1.0)
     window 기본값 = WINDOW(10), 100일 등 다른 값도 허용.
+    return_dates=True면 (X, y, dates) 반환 — fold별로 종목 데이터를 다시
+    계산하지 않고 "이 종목의 전체 기간을 한 번만 계산해두고 fold의 train_end
+    기준으로 날짜만 잘라 쓰는" 캐싱(train_c.py의 per-ticker 캐시)에 필요.
     """
     df = price_df.copy()
     df["Date"] = pd.to_datetime(df["Date"])
@@ -287,7 +291,7 @@ def make_sequences(
 
     label_map = label_df.set_index("Date")["label"].to_dict()
 
-    xs, ys = [], []
+    xs, ys, ds = [], [], []
 
     for i in range(window, len(df)):
         date = df.iloc[i]["Date"]
@@ -312,8 +316,13 @@ def make_sequences(
         x = np.stack([o, h, l, c, v], axis=0).astype(np.float32)  # (5, window)
         xs.append(x)
         ys.append(int(label))
+        ds.append(date)
 
-    return np.array(xs), np.array(ys, dtype=np.int64)
+    X = np.array(xs)
+    y = np.array(ys, dtype=np.int64)
+    if return_dates:
+        return X, y, np.array(ds, dtype="datetime64[ns]")
+    return X, y
 
 
 # ── 학습 ─────────────────────────────────────────────────────────────────────

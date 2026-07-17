@@ -281,16 +281,19 @@ def make_lstm_sequences(
     tech_df: pd.DataFrame,
     label_df: pd.DataFrame,
     window: int = WINDOW,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_dates: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     (X, y) 시퀀스 생성.
 
     X shape: (N, window, N_FEATURES)
     y shape: (N,)
     window 기본값 = WINDOW(20), 100일 등 다른 값도 허용.
+    return_dates=True면 (X, y, dates) 반환 — make_sequences와 동일한 이유
+    (fold별 재계산 없이 종목당 한 번만 계산해서 날짜로 잘라 쓰는 캐싱용).
     """
     label_map = label_df.set_index("Date")["label"].to_dict()
-    xs, ys = [], []
+    xs, ys, ds = [], [], []
 
     idx = tech_df.index
     feat_vals = tech_df[LSTM_FEATURES].values
@@ -302,8 +305,13 @@ def make_lstm_sequences(
         seq = feat_vals[i - window: i].astype(np.float32)
         xs.append(seq)
         ys.append(int(label_map[date]))
+        ds.append(date)
 
-    return np.array(xs), np.array(ys, dtype=np.int64)
+    X = np.array(xs)
+    y = np.array(ys, dtype=np.int64)
+    if return_dates:
+        return X, y, np.array(ds, dtype="datetime64[ns]")
+    return X, y
 
 
 # ── 학습 ─────────────────────────────────────────────────────────────────────

@@ -254,9 +254,12 @@ def collect_all_ohlcv_streaming(
         ticker_cache[ticker] = (df, label_df, tech_df)
 
     # ── 1차 패스: 샘플 개수만 집계(디스크 미사용, 캐시에서 펼치기만) ────────────
+    # 진행바 없이 돌리면 "OHLCV 수집"과 똑같이 무거운 윈도우 펼치기 연산을
+    # 조용히 하고 있어서 멈춘 것처럼 보인다(2026-07-18, 콜랩에서 실제로 이걸
+    # 멈춘 줄 알고 문의 받음) — 진행바를 달아 눈에 보이게 한다.
     n_cnn_total = 0
     n_lstm_total = 0
-    for df, label_df, tech_df in ticker_cache.values():
+    for df, label_df, tech_df in tqdm(ticker_cache.values(), total=len(ticker_cache), desc="샘플 수 집계(2차 패스 전 카운팅)"):
         X_cnn, _ = make_sequences(df, label_df)
         n_cnn_total += len(X_cnn)
         if tech_df is not None:
@@ -705,15 +708,22 @@ def run_c_wfv_bin(
             # 90% 밑) 20에폭 연속 개선이 없으면 멈춘다. 이 확인 전까지는 절대
             # 멈추지 않아서 "학습 자체가 안 되는" 실패 상태를 조기종료로
             # 착각하는 일은 없다.
+            # num_workers>0 — 대용량 memmap(fold1 LSTM 배열만 28GB대)에서 배치마다
+            # 무작위로 읽어오는 게 GPU 연산보다 느려서 GPU 사용률이 0%↔30%대를
+            # 왔다갔다 하는 걸 콜랩에서 실측(2026-07-17) — 별도 프로세스가 다음
+            # 배치를 미리 읽어오게 해서 이 병목을 줄인다. 윈도우는 멀티프로세싱
+            # spawn 방식이 이 launcher 스크립트 구조상 안전하지 않아 0(끔) 유지.
+            import os as _os
+            _workers = 4 if _os.name != "nt" else 0
             cnn_model  = train_cnn(
                 X_cnn,  y_cnn,  arch_params=cnn_params_bin,  epochs=200, device_str=device,
-                batch_size=4096,
+                batch_size=4096, num_workers=_workers, pin_memory=(device == "cuda"),
                 checkpoint_path=str(cnn_ckpt_path), checkpoint_every=25,
                 early_stopping_patience=20,
             )
             lstm_model = train_lstm(
                 X_lstm, y_lstm, arch_params=lstm_params_bin, epochs=200, device_str=device,
-                batch_size=4096,
+                batch_size=4096, num_workers=_workers, pin_memory=(device == "cuda"),
                 checkpoint_path=str(lstm_ckpt_path), checkpoint_every=25,
                 early_stopping_patience=20,
             )

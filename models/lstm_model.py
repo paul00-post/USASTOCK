@@ -328,6 +328,8 @@ def train_lstm(
     checkpoint_every: int = 25,
     early_stopping_patience: int | None = None,
     early_stopping_min_delta: float = 1e-3,
+    num_workers: int = 0,
+    pin_memory: bool = False,
 ) -> LSTMModel:
     """LSTM 학습. 최소 200 에폭, loss > ln(n_classes) 이면 경고.
 
@@ -339,6 +341,9 @@ def train_lstm(
         (2026-07-17 도입) — "다수 클래스만 찍는" 랜덤 추측 수준(ln(n_classes))
         보다 확실히 낮아지기 전까지는 patience를 세지 않는다.
     early_stopping_min_delta : 이보다 적게 개선되면 "개선 없음"으로 친다.
+    num_workers/pin_memory : cnn_model.train_cnn과 동일한 이유(대용량 memmap
+        무작위 읽기로 GPU가 노는 문제, 2026-07-17 콜랩 실측) — 윈도우는 기본값
+        0(끔), 리눅스에서만 명시적으로 올려서 쓴다.
     """
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
 
@@ -355,7 +360,11 @@ def train_lstm(
     ).to(device)
 
     dataset    = LSTMDataset(X_train, y_train, window=X_train.shape[1])
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    dataloader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0), prefetch_factor=(4 if num_workers > 0 else None),
+    )
     optimizer  = torch.optim.Adam(model.parameters(), lr=lr)
     criterion  = nn.CrossEntropyLoss()
 

@@ -339,6 +339,8 @@ def train_cnn(
     checkpoint_every: int = 25,
     early_stopping_patience: int | None = None,
     early_stopping_min_delta: float = 1e-3,
+    num_workers: int = 0,
+    pin_memory: bool = False,
 ) -> CNN1DModel:
     """
     CNN-1D 학습.
@@ -355,6 +357,13 @@ def train_cnn(
         실제로 겪은 문제)에서 "안 좋아지네" 하고 일찍 멈춰버리는 정반대 결과가
         나올 수 있다.
     early_stopping_min_delta : 이보다 적게 개선되면 "개선 없음"으로 친다.
+    num_workers/pin_memory : X_train이 대용량 np.memmap일 때(전종목 WFV 학습)
+        배치마다 무작위 위치를 디스크에서 읽어오는 게 GPU 연산보다 느려서 GPU가
+        노는 문제가 있다(2026-07-17, 콜랩에서 실측 확인 — GPU 사용률이 0%↔30%대를
+        왔다갔다 함). num_workers>0이면 별도 프로세스가 다음 배치를 미리
+        읽어와서 GPU가 노는 시간을 줄인다. 윈도우는 멀티프로세싱 spawn 방식이라
+        `if __name__ == "__main__":` 가드 없이 쓰면 위험해서 기본값 0(끔) —
+        리눅스(콜랩 등)에서만 명시적으로 올려서 쓴다.
     """
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
 
@@ -371,7 +380,11 @@ def train_cnn(
     ).to(device)
 
     dataset    = CNN1DDataset(X_train, y_train, window=X_train.shape[2])
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    dataloader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0), prefetch_factor=(4 if num_workers > 0 else None),
+    )
     optimizer  = torch.optim.Adam(model.parameters(), lr=lr)
     criterion  = nn.CrossEntropyLoss()
 
